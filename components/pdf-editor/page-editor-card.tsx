@@ -8,7 +8,14 @@ import {
   resolveEffectiveFontStyle,
   resolveEffectiveFontWeight,
 } from "../../lib/pdf-editor/fonts";
-import type { Overlay, RenderedPage, SourceTextBlock, TextOverlay, TextVariant } from "../../lib/pdf-editor/types";
+import type {
+  ImageOverlay,
+  Overlay,
+  RenderedPage,
+  SourceTextBlock,
+  TextOverlay,
+  TextVariant,
+} from "../../lib/pdf-editor/types";
 import { getTextVariantMetrics } from "../../lib/pdf-editor/utils";
 import { FONT_SIZES, TEXT_BOX_PADDING } from "../../lib/pdf-editor/constants";
 import {
@@ -26,6 +33,7 @@ export function PageEditorCard({
   page,
   pageIndex,
   pagePreviewUrl,
+  zoom,
   pageRef,
   overlays,
   isRemoved,
@@ -49,10 +57,12 @@ export function PageEditorCard({
   onEditOverlay,
   onStopTextEditing,
   onOverlayPointerDown,
+  onImageResizePointerDown,
 }: {
   page: RenderedPage;
   pageIndex: number;
   pagePreviewUrl: string;
+  zoom: number;
   pageRef: (element: HTMLDivElement | null) => void;
   overlays: Overlay[];
   isRemoved: boolean;
@@ -79,6 +89,10 @@ export function PageEditorCard({
     event: ReactPointerEvent<HTMLElement>,
     overlay: Overlay,
   ) => void;
+  onImageResizePointerDown: (
+    event: ReactPointerEvent<HTMLElement>,
+    overlay: ImageOverlay,
+  ) => void;
 }) {
   const replacementPreviewReady = pagePreviewUrl !== page.previewUrl;
   const activeTextOverlay = overlays.find(
@@ -95,63 +109,76 @@ export function PageEditorCard({
 
   return (
     <article className={`page-card ${isRemoved ? "removed" : ""}`}>
-      <div className="page-toolbar">
-        <div><h2>Page {pageIndex + 1}</h2></div>
-        <div className="icon-toolbar">
-          <PageToolButton label="Add text" onClick={onAddText}>
-            <TextIcon />
-          </PageToolButton>
-          <PageToolButton
-            label={ocrRunning ? "Running OCR" : "Run OCR"}
-            onClick={onRunOcr}
-            disabled={ocrRunning}
-          >
-            <OcrIcon />
-          </PageToolButton>
-          <label
-            className="icon-button file-button"
-            title="Add image"
-            aria-label="Add image"
-            data-tooltip="Add image"
-          >
-            <ImageIcon />
-            <span className="sr-only">Add image</span>
-            <input
-              type="file"
-              accept="image/png,image/jpeg,image/webp"
-              onChange={onImagePicked}
-            />
-          </label>
-          <PageToolButton
-            label="Add signature"
-            disabled={!hasSignature}
-            onClick={onAddSignature}
-          >
-            <SignatureIcon />
-          </PageToolButton>
-          <PageToolButton label="Add mask" onClick={onAddMask}>
-            <MaskIcon />
-          </PageToolButton>
-          <PageToolButton label="Add watermark" onClick={onAddWatermark}>
-            <WatermarkIcon />
-          </PageToolButton>
-          <PageToolButton
-            label={isRemoved ? "Restore page" : "Remove page"}
-            danger={isRemoved}
-            onClick={onTogglePageRemoval}
-          >
-            <PageRemoveIcon />
-          </PageToolButton>
-        </div>
-      </div>
-
       <div className="page-scroll">
-        <div
-          className="page-canvas"
-          ref={pageRef}
-          style={{ width: page.width, height: page.height }}
-          onPointerDown={(event) => onCanvasPointerDown(event, pageIndex)}
-        >
+        <div className="page-stage">
+          <div className="page-badge">Page {pageIndex + 1}</div>
+          <div className="page-toolbar">
+            <div className="icon-toolbar compact">
+              <PageToolButton label="Add text" onClick={onAddText}>
+                <TextIcon />
+              </PageToolButton>
+              <PageToolButton
+                label={ocrRunning ? "Running OCR" : "Run OCR"}
+                onClick={onRunOcr}
+                disabled={ocrRunning}
+              >
+                <OcrIcon />
+              </PageToolButton>
+              <label
+                className="icon-button file-button"
+                title="Add image"
+                aria-label="Add image"
+                data-tooltip="Add image"
+              >
+                <ImageIcon />
+                <span className="sr-only">Add image</span>
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp"
+                  onChange={onImagePicked}
+                />
+              </label>
+              <PageToolButton
+                label="Add signature"
+                disabled={!hasSignature}
+                onClick={onAddSignature}
+              >
+                <SignatureIcon />
+              </PageToolButton>
+              <PageToolButton label="Add mask" onClick={onAddMask}>
+                <MaskIcon />
+              </PageToolButton>
+              <PageToolButton label="Add watermark" onClick={onAddWatermark}>
+                <WatermarkIcon />
+              </PageToolButton>
+              <PageToolButton
+                label={isRemoved ? "Restore page" : "Remove page"}
+                danger={isRemoved}
+                onClick={onTogglePageRemoval}
+              >
+                <PageRemoveIcon />
+              </PageToolButton>
+            </div>
+          </div>
+
+          <div
+            className="page-zoom-shell"
+            style={{
+              width: page.width * zoom,
+              height: page.height * zoom,
+            }}
+          >
+            <div
+              className="page-canvas"
+              ref={pageRef}
+              style={{
+                width: page.width,
+                height: page.height,
+                transform: `scale(${zoom})`,
+                transformOrigin: "top left",
+              }}
+              onPointerDown={(event) => onCanvasPointerDown(event, pageIndex)}
+            >
           <img
             src={pagePreviewUrl}
             alt={`Preview of page ${pageIndex + 1}`}
@@ -324,18 +351,26 @@ export function PageEditorCard({
               paddingTop:
                 overlay.kind === "text"
                   ? (overlay.paddingY ?? TEXT_BOX_PADDING) + domTextOffsetY
+                  : overlay.kind === "image"
+                    ? 0
                   : 10,
               paddingRight:
                 overlay.kind === "text"
                   ? overlay.paddingX ?? TEXT_BOX_PADDING
+                  : overlay.kind === "image"
+                    ? 0
                   : 10,
               paddingBottom:
                 overlay.kind === "text"
                   ? overlay.paddingY ?? TEXT_BOX_PADDING
+                  : overlay.kind === "image"
+                    ? 0
                   : 10,
               paddingLeft:
                 overlay.kind === "text"
                   ? overlay.paddingX ?? TEXT_BOX_PADDING
+                  : overlay.kind === "image"
+                    ? 0
                   : 10,
               color:
                 overlay.kind === "mask"
@@ -347,9 +382,12 @@ export function PageEditorCard({
                 overlay.kind === "mask"
                   ? overlay.color
                   : overlay.kind === "image"
-                    ? "rgba(255,255,255,0.12)"
+                    ? "transparent"
                     : "transparent",
-              opacity: overlay.kind === "watermark" ? overlay.opacity : 1,
+              opacity:
+                overlay.kind === "watermark" || overlay.kind === "image"
+                  ? overlay.opacity
+                  : 1,
               transform:
                 overlay.kind === "watermark"
                   ? `rotate(${overlay.rotation}deg)`
@@ -435,12 +473,20 @@ export function PageEditorCard({
                     onPointerDown={(event) => onOverlayPointerDown(event, overlay)}
                   >
                     {overlay.kind === "image" ? (
-                      <img
-                        src={overlay.dataUrl}
-                        alt={overlay.label}
-                        width={overlay.width}
-                        height={overlay.height}
-                      />
+                      <>
+                        <img
+                          src={overlay.dataUrl}
+                          alt={overlay.label}
+                          width={overlay.width}
+                          height={overlay.height}
+                        />
+                        {selectedOverlayId === overlay.id ? (
+                          <span
+                            className="image-resize-handle"
+                            onPointerDown={(event) => onImageResizePointerDown(event, overlay)}
+                          />
+                        ) : null}
+                      </>
                     ) : overlay.kind === "mask" ? (
                       <span>Masked area</span>
                     ) : (
@@ -452,7 +498,9 @@ export function PageEditorCard({
             );
           })}
 
-          {isRemoved ? <div className="page-removed-badge">Removed</div> : null}
+              {isRemoved ? <div className="page-removed-badge">Removed</div> : null}
+            </div>
+          </div>
         </div>
       </div>
 

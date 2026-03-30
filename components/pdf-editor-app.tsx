@@ -12,6 +12,7 @@ import {
 import { PDFDocument, degrees } from "pdf-lib";
 
 import { PageEditorCard } from "./pdf-editor/page-editor-card";
+import { RedoIcon, UndoIcon, ZoomInIcon, ZoomOutIcon } from "./pdf-editor/icons";
 import { SelectionInspector } from "./pdf-editor/selection-inspector";
 import { SignaturePad } from "./pdf-editor/signature-pad";
 import { EMPTY_TEXT_STYLE, FONT_SIZES, TEXT_BOX_PADDING } from "../lib/pdf-editor/constants";
@@ -52,6 +53,17 @@ import {
   readFileAsDataUrl,
 } from "../lib/pdf-editor/utils";
 
+type EditorSnapshot = {
+  pages: RenderedPage[];
+  overlays: Overlay[];
+  removedPages: number[];
+};
+
+const HISTORY_LIMIT = 120;
+const ZOOM_MIN = 0.6;
+const ZOOM_MAX = 2.4;
+const ZOOM_STEP = 0.2;
+
 function buildPreviewReplacements(
   pages: RenderedPage[],
   overlays: Overlay[],
@@ -91,6 +103,25 @@ function buildPreviewReplacements(
   );
 }
 
+function clonePages(pages: RenderedPage[]) {
+  return pages.map((page) => ({
+    ...page,
+    textBlocks: page.textBlocks.map((textBlock) => ({ ...textBlock })),
+  }));
+}
+
+function cloneOverlays(overlays: Overlay[]) {
+  return overlays.map((overlay) => ({ ...overlay }));
+}
+
+function cloneSnapshot(snapshot: EditorSnapshot): EditorSnapshot {
+  return {
+    pages: clonePages(snapshot.pages),
+    overlays: cloneOverlays(snapshot.overlays),
+    removedPages: [...snapshot.removedPages],
+  };
+}
+
 export function PdfEditorApp() {
   const [fileName, setFileName] = useState("edited-document.pdf");
   const [pdfBytes, setPdfBytes] = useState<Uint8Array | null>(null);
@@ -107,10 +138,18 @@ export function PdfEditorApp() {
   const [isDragActive, setIsDragActive] = useState(false);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
   const [draggingOverlayId, setDraggingOverlayId] = useState<string | null>(null);
   const [, setStatusMessage] = useState("Ready");
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const dragDepthRef = useRef(0);
+  const pagesRef = useRef<RenderedPage[]>([]);
+  const overlaysRef = useRef<Overlay[]>([]);
+  const removedPagesRef = useRef<number[]>([]);
+  const historyRef = useRef<EditorSnapshot[]>([]);
+  const historyIndexRef = useRef(-1);
 
   const previewReplacementsByPage = useMemo(
     () => buildPreviewReplacements(pages, overlays),
@@ -120,6 +159,134 @@ export function PdfEditorApp() {
     () => overlays.find((overlay) => overlay.id === selectedOverlayId) ?? null,
     [overlays, selectedOverlayId],
   );
+
+  function syncHistoryFlags() {
+    setCanUndo(historyIndexRef.current > 0);
+    setCanRedo(historyIndexRef.current >= 0 && historyIndexRef.current < historyRef.current.length - 1);
+  }
+
+  function getSnapshot(overrides?: Partial<EditorSnapshot>) {
+    return cloneSnapshot({
+      pages: overrides?.pages ?? pagesRef.current,
+      overlays: overrides?.overlays ?? overlaysRef.current,
+      removedPages: overrides?.removedPages ?? removedPagesRef.current,
+    });
+  }
+
+  function applySnapshot(
+    snapshot: EditorSnapshot,
+    options?: {
+      recordHistory?: boolean;
+      resetHistory?: boolean;
+      clearSelection?: boolean;
+    },
+  ) {
+    const nextSnapshot = cloneSnapshot(snapshot);
+
+    pagesRef.current = nextSnapshot.pages;
+    overlaysRef.current = nextSnapshot.overlays;
+    removedPagesRef.current = nextSnapshot.removedPages;
+
+    setPages(nextSnapshot.pages);
+    setOverlays(nextSnapshot.overlays);
+    setRemovedPages(nextSnapshot.removedPages);
+
+    if (options?.clearSelection) {
+      clearActiveSelection();
+    } else {
+      const overlayIds = new Set(nextSnapshot.overlays.map((overlay) => overlay.id));
+      setSelectedOverlayId((current) => (current && overlayIds.has(current) ? current : null));
+      setEditingTextOverlayId((current) => (current && overlayIds.has(current) ? current : null));
+      setDraggingOverlayId(null);
+    }
+
+    if (options?.resetHistory) {
+      historyRef.current = [cloneSnapshot(nextSnapshot)];
+      historyIndexRef.current = 0;
+      syncHistoryFlags();
+      return;
+    }
+
+    if (options?.recordHistory) {
+      const nextHistory = [
+        ...historyRef.current.slice(0, historyIndexRef.current + 1),
+        cloneSnapshot(nextSnapshot),
+      ];
+
+      if (nextHistory.length > HISTORY_LIMIT) {
+        nextHistory.splice(0, nextHistory.length - HISTORY_LIMIT);
+      }
+
+      historyRef.current = nextHistory;
+      historyIndexRef.current = nextHistory.length - 1;
+      syncHistoryFlags();
+    }
+  }
+
+  function applyOverlayChange(
+    recipe: (current: Overlay[]) => Overlay[],
+    options?: { recordHistory?: boolean },
+  ) {
+    const nextOverlays = recipe(overlaysRef.current);
+    applySnapshot(
+      getSnapshot({ overlays: nextOverlays }),
+      { recordHistory: options?.recordHistory !== false },
+    );
+  }
+
+  function undo() {
+    if (historyIndexRef.current <= 0) return;
+    historyIndexRef.current -= 1;
+    syncHistoryFlags();
+    applySnapshot(historyRef.current[historyIndexRef.current], { clearSelection: true });
+  }
+
+  function redo() {
+    if (historyIndexRef.current >= historyRef.current.length - 1) return;
+    historyIndexRef.current += 1;
+    syncHistoryFlags();
+    applySnapshot(historyRef.current[historyIndexRef.current], { clearSelection: true });
+  }
+
+  function adjustZoom(direction: 1 | -1) {
+    setZoom((current) => clamp(Number((current + direction * ZOOM_STEP).toFixed(2)), ZOOM_MIN, ZOOM_MAX));
+  }
+
+  useEffect(() => {
+    pagesRef.current = pages;
+  }, [pages]);
+
+  useEffect(() => {
+    overlaysRef.current = overlays;
+  }, [overlays]);
+
+  useEffect(() => {
+    removedPagesRef.current = removedPages;
+  }, [removedPages]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const modifier = event.metaKey || event.ctrlKey;
+      if (!modifier) return;
+
+      if (event.key.toLowerCase() === "z" && !event.shiftKey) {
+        event.preventDefault();
+        undo();
+        return;
+      }
+
+      if (
+        (event.key.toLowerCase() === "z" && event.shiftKey) ||
+        event.key.toLowerCase() === "y"
+      ) {
+        event.preventDefault();
+        redo();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   useEffect(() => {
     if (pages.length === 0) {
@@ -181,12 +348,20 @@ export function PdfEditorApp() {
       const renderedPages = await renderPdfPages(renderBytes);
 
       setPdfBytes(exportBytes);
-      setPages(renderedPages);
       setPagePreviewUrls(renderedPages.map((page) => page.previewUrl));
-      setOverlays([]);
-      setRemovedPages([]);
-      clearActiveSelection();
+      applySnapshot(
+        {
+          pages: renderedPages,
+          overlays: [],
+          removedPages: [],
+        },
+        {
+          resetHistory: true,
+          clearSelection: true,
+        },
+      );
       setShowTextTargets(false);
+      setZoom(1);
       setFileName(file.name.replace(/\.pdf$/i, "") + "-edited.pdf");
       setStatusMessage("Loaded");
     } catch (error) {
@@ -266,7 +441,7 @@ export function PdfEditorApp() {
       lineHeight: textMetrics.lineHeight,
       textOffsetY: 0,
     };
-    setOverlays((current) => [...current, overlay]);
+    applyOverlayChange((current) => [...current, overlay]);
     setSelectedOverlayId(overlay.id);
     setEditingTextOverlayId(overlay.id);
     setStatusMessage("Text added");
@@ -294,12 +469,13 @@ export function PdfEditorApp() {
       y: 60,
       width: frame.width,
       height: frame.height,
+      aspectRatio: Math.max(width / Math.max(height, 1), 0.1),
       dataUrl,
       label,
       opacity: 1,
     };
 
-    setOverlays((current) => [...current, overlay]);
+    applyOverlayChange((current) => [...current, overlay]);
     setSelectedOverlayId(overlay.id);
     setStatusMessage("Image added");
   }
@@ -317,7 +493,7 @@ export function PdfEditorApp() {
       color: "#111111",
     };
 
-    setOverlays((current) => [...current, overlay]);
+    applyOverlayChange((current) => [...current, overlay]);
     setSelectedOverlayId(overlay.id);
     setStatusMessage("Mask added");
   }
@@ -339,17 +515,43 @@ export function PdfEditorApp() {
       variant: "h2",
     };
 
-    setOverlays((current) => [...current, overlay]);
+    applyOverlayChange((current) => [...current, overlay]);
     setSelectedOverlayId(overlay.id);
     setStatusMessage("Watermark added");
   }
 
-  function updateOverlay(id: string, patch: Partial<Overlay>) {
-    setOverlays((current) =>
-      current.map((overlay) => {
+  function updateOverlay(
+    id: string,
+    patch: Partial<Overlay>,
+    options?: { recordHistory?: boolean },
+  ) {
+    applyOverlayChange(
+      (current) =>
+        current.map((overlay) => {
         if (overlay.id !== id) return overlay;
 
         const nextOverlay = { ...overlay, ...patch } as Overlay;
+        if (nextOverlay.kind === "image") {
+          const aspectRatio = Math.max(nextOverlay.aspectRatio || overlay.width / overlay.height, 0.1);
+          let width = Math.max(nextOverlay.width, 40);
+          let height = Math.max(nextOverlay.height, 24);
+
+          if (patch.width !== undefined) {
+            width = Math.max(Number(patch.width), 40);
+            height = Math.max(width / aspectRatio, 24);
+          } else if (patch.height !== undefined) {
+            height = Math.max(Number(patch.height), 24);
+            width = Math.max(height * aspectRatio, 40);
+          }
+
+          return {
+            ...nextOverlay,
+            aspectRatio,
+            width,
+            height,
+          } satisfies ImageOverlay;
+        }
+
         if (nextOverlay.kind !== "text") {
           return nextOverlay;
         }
@@ -375,22 +577,26 @@ export function PdfEditorApp() {
               ? Math.max(normalizedOverlay.height, estimated.height)
               : normalizedOverlay.height,
         } satisfies TextOverlay;
-      }),
+        }),
+      { recordHistory: options?.recordHistory !== false },
     );
   }
 
   function removeOverlay(id: string) {
-    setOverlays((current) => current.filter((overlay) => overlay.id !== id));
+    applyOverlayChange((current) => current.filter((overlay) => overlay.id !== id));
     setSelectedOverlayId((current) => (current === id ? null : current));
     setEditingTextOverlayId((current) => (current === id ? null : current));
     setStatusMessage("Removed");
   }
 
   function togglePageRemoval(pageIndex: number) {
-    setRemovedPages((current) =>
-      current.includes(pageIndex)
-        ? current.filter((entry) => entry !== pageIndex)
-        : [...current, pageIndex].sort((left, right) => left - right),
+    applySnapshot(
+      getSnapshot({
+        removedPages: removedPagesRef.current.includes(pageIndex)
+          ? removedPagesRef.current.filter((entry) => entry !== pageIndex)
+          : [...removedPagesRef.current, pageIndex].sort((left, right) => left - right),
+      }),
+      { recordHistory: true },
     );
     setStatusMessage("Updated");
   }
@@ -431,8 +637,9 @@ export function PdfEditorApp() {
     );
 
     if (existingOverlay) {
-      setOverlays((current) =>
-        current.map((overlay) =>
+      applyOverlayChange(
+        (current) =>
+          current.map((overlay) =>
           overlay.id === existingOverlay.id && overlay.kind === "text"
             ? normalizeTextOverlayFormatting({
                 ...overlay,
@@ -440,6 +647,7 @@ export function PdfEditorApp() {
               })
             : overlay,
         ),
+        { recordHistory: false },
       );
       setSelectedOverlayId(existingOverlay.id);
       setEditingTextOverlayId(existingOverlay.id);
@@ -494,10 +702,18 @@ export function PdfEditorApp() {
       textOffsetY: textBlock.textOffsetY,
     });
 
-    setOverlays((current) => [...current, overlay]);
+    applyOverlayChange((current) => [...current, overlay]);
     setSelectedOverlayId(overlay.id);
     setEditingTextOverlayId(overlay.id);
     setStatusMessage("Text selected");
+  }
+
+  function getPageScale(pageElement: HTMLDivElement) {
+    const rect = pageElement.getBoundingClientRect();
+    return {
+      x: rect.width / Math.max(pageElement.clientWidth, 1),
+      y: rect.height / Math.max(pageElement.clientHeight, 1),
+    };
   }
 
   function handleOverlayPointerDown(
@@ -510,8 +726,9 @@ export function PdfEditorApp() {
     if (!pageElement) return;
 
     const rect = pageElement.getBoundingClientRect();
-    const offsetX = event.clientX - rect.left - overlay.x;
-    const offsetY = event.clientY - rect.top - overlay.y;
+    const pageScale = getPageScale(pageElement);
+    const offsetX = (event.clientX - rect.left) / pageScale.x - overlay.x;
+    const offsetY = (event.clientY - rect.top) / pageScale.y - overlay.y;
 
     if (overlay.kind === "text" || overlay.kind === "watermark") {
       setEditingTextOverlayId(null);
@@ -524,24 +741,91 @@ export function PdfEditorApp() {
       const currentPageElement = pageRefs.current[overlay.pageIndex];
       if (!currentPageElement) return;
       const pageRect = currentPageElement.getBoundingClientRect();
+      const currentPageScale = getPageScale(currentPageElement);
       const nextX = clamp(
-        pointerEvent.clientX - pageRect.left - offsetX,
+        (pointerEvent.clientX - pageRect.left) / currentPageScale.x - offsetX,
         0,
         Math.max(currentPageElement.clientWidth - overlay.width, 0),
       );
       const nextY = clamp(
-        pointerEvent.clientY - pageRect.top - offsetY,
+        (pointerEvent.clientY - pageRect.top) / currentPageScale.y - offsetY,
         0,
         Math.max(currentPageElement.clientHeight - overlay.height, 0),
       );
 
-      updateOverlay(overlay.id, { x: nextX, y: nextY });
+      updateOverlay(overlay.id, { x: nextX, y: nextY }, { recordHistory: false });
+      didMove = true;
     };
+
+    let didMove = false;
 
     const release = () => {
       setDraggingOverlayId((current) => (current === overlay.id ? null : current));
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", release);
+      if (didMove) {
+        applySnapshot(getSnapshot(), { recordHistory: true });
+      }
+    };
+
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", release, { once: true });
+  }
+
+  function handleImageResizePointerDown(
+    event: ReactPointerEvent<HTMLElement>,
+    overlay: ImageOverlay,
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    const pageElement = pageRefs.current[overlay.pageIndex];
+    if (!pageElement) return;
+
+    const startWidth = overlay.width;
+    const startHeight = overlay.height;
+    const aspectRatio = Math.max(overlay.aspectRatio || startWidth / Math.max(startHeight, 1), 0.1);
+    const pageScale = getPageScale(pageElement);
+    const startClientX = event.clientX;
+    const startClientY = event.clientY;
+
+    setSelectedOverlayId(overlay.id);
+    setDraggingOverlayId(overlay.id);
+
+    const move = (pointerEvent: PointerEvent) => {
+      const currentPageElement = pageRefs.current[overlay.pageIndex];
+      if (!currentPageElement) return;
+
+      const maxWidth = Math.max(currentPageElement.clientWidth - overlay.x, 40);
+      const maxHeight = Math.max(currentPageElement.clientHeight - overlay.y, 24);
+      const deltaX = (pointerEvent.clientX - startClientX) / pageScale.x;
+      const deltaY = (pointerEvent.clientY - startClientY) / pageScale.y;
+      const widthFromX = startWidth + deltaX;
+      const widthFromY = startWidth + deltaY * aspectRatio;
+      let nextWidth = clamp(
+        Math.abs(deltaX) >= Math.abs(deltaY) ? widthFromX : widthFromY,
+        40,
+        maxWidth,
+      );
+      let nextHeight = Math.max(nextWidth / aspectRatio, 24);
+
+      if (nextHeight > maxHeight) {
+        nextHeight = maxHeight;
+        nextWidth = Math.max(nextHeight * aspectRatio, 40);
+      }
+
+      updateOverlay(overlay.id, { width: nextWidth, height: nextHeight }, { recordHistory: false });
+      didResize = true;
+    };
+
+    let didResize = false;
+
+    const release = () => {
+      setDraggingOverlayId((current) => (current === overlay.id ? null : current));
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", release);
+      if (didResize) {
+        applySnapshot(getSnapshot(), { recordHistory: true });
+      }
     };
 
     window.addEventListener("pointermove", move);
@@ -574,10 +858,13 @@ export function PdfEditorApp() {
       const ocrTextBlocks = buildOcrTextBlocks(ocrBlocks, pageIndex);
       await worker.terminate();
 
-      setPages((current) =>
-        current.map((entry, index) =>
-          index === pageIndex ? { ...entry, textBlocks: ocrTextBlocks } : entry,
-        ),
+      applySnapshot(
+        getSnapshot({
+          pages: pagesRef.current.map((entry, index) =>
+            index === pageIndex ? { ...entry, textBlocks: ocrTextBlocks } : entry,
+          ),
+        }),
+        { recordHistory: true },
       );
       setStatusMessage(ocrTextBlocks.length > 0 ? "OCR ready" : "OCR empty");
     } catch (error) {
@@ -831,6 +1118,56 @@ export function PdfEditorApp() {
         onDragLeave={handleDropzoneDragLeave}
         onDrop={(event) => void handleDropzoneDrop(event)}
       >
+        <div className="viewer-controls">
+          <button
+            type="button"
+            className="icon-button"
+            data-tooltip="Undo"
+            title="Undo"
+            aria-label="Undo"
+            onClick={undo}
+            disabled={!canUndo}
+          >
+            <UndoIcon />
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            data-tooltip="Redo"
+            title="Redo"
+            aria-label="Redo"
+            onClick={redo}
+            disabled={!canRedo}
+          >
+            <RedoIcon />
+          </button>
+          <div className="viewer-zoom-controls">
+            <button
+              type="button"
+              className="icon-button"
+              data-tooltip="Zoom out"
+              title="Zoom out"
+              aria-label="Zoom out"
+              onClick={() => adjustZoom(-1)}
+              disabled={pages.length === 0 || zoom <= ZOOM_MIN}
+            >
+              <ZoomOutIcon />
+            </button>
+            <span className="zoom-readout">{Math.round(zoom * 100)}%</span>
+            <button
+              type="button"
+              className="icon-button"
+              data-tooltip="Zoom in"
+              title="Zoom in"
+              aria-label="Zoom in"
+              onClick={() => adjustZoom(1)}
+              disabled={pages.length === 0 || zoom >= ZOOM_MAX}
+            >
+              <ZoomInIcon />
+            </button>
+          </div>
+        </div>
+
         {pages.length === 0 ? (
           <label
             className={`empty-card minimal-empty upload-dropzone viewer-dropzone ${
@@ -856,6 +1193,7 @@ export function PdfEditorApp() {
             page={page}
             pageIndex={pageIndex}
             pagePreviewUrl={pagePreviewUrls[pageIndex] ?? page.previewUrl}
+            zoom={zoom}
             pageRef={(element) => {
               pageRefs.current[pageIndex] = element;
             }}
@@ -886,6 +1224,7 @@ export function PdfEditorApp() {
             }}
             onStopTextEditing={() => setEditingTextOverlayId(null)}
             onOverlayPointerDown={handleOverlayPointerDown}
+            onImageResizePointerDown={handleImageResizePointerDown}
           />
         ))}
 

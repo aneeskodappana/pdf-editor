@@ -68,6 +68,7 @@ export type ImageOverlay = BaseOverlay & {
   kind: "image";
   dataUrl: string;
   label: string;
+  aspectRatio: number;
   opacity: number;
 };
 
