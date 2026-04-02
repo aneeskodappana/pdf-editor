@@ -30,6 +30,7 @@ export type SourceTextBlock = {
   cssFontWeight?: number;
   cssFontStyle?: string;
   color: string;
+  sampledBgColor: string;
   lineHeight: number;
   textOffsetY: number;
   bold: boolean;

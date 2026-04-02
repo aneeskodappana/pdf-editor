@@ -800,7 +800,7 @@ export function PdfEditorApp() {
       underline: false,
       strike: false,
       color: textBlock.color,
-      backgroundColor: "#ffffff",
+      backgroundColor: textBlock.sampledBgColor,
       sourceTextId: textBlock.id,
       maskWidth: textBlock.width + 4,
       maskHeight: textBlock.height + 4,
@@ -995,17 +995,6 @@ export function PdfEditorApp() {
     setStatusMessage("Exporting");
 
     try {
-      const exportPreviewReplacementsByPage = buildPreviewReplacements(pages, overlays).map(
-        (replacements) =>
-          replacements.map((replacement) => ({
-            ...replacement,
-            renderText: true,
-          })),
-      );
-      const flattenedPageIndices = exportPreviewReplacementsByPage
-        .map((replacements, pageIndex) => (replacements.length > 0 ? pageIndex : -1))
-        .filter((pageIndex) => pageIndex >= 0);
-      const exportBaseImages = await renderPdfPageImages(pdfBytes, flattenedPageIndices, 3.2);
       const document = await PDFDocument.load(pdfBytes);
       const removed = document
         .getPages()
@@ -1027,6 +1016,20 @@ export function PdfEditorApp() {
           nextPageIndex += 1;
         }
       });
+      // Canvas compositing for text replacements — renders text with browser
+      // fonts (matching originals) and uses the correctly sampled background
+      // color to cover old text seamlessly.
+      const exportPreviewReplacementsByPage = buildPreviewReplacements(pages, overlays).map(
+        (replacements) =>
+          replacements.map((replacement) => ({
+            ...replacement,
+            renderText: true,
+          })),
+      );
+      const flattenedPageIndices = exportPreviewReplacementsByPage
+        .map((replacements, pageIndex) => (replacements.length > 0 ? pageIndex : -1))
+        .filter((pageIndex) => pageIndex >= 0);
+      const exportBaseImages = await renderPdfPageImages(pdfBytes, flattenedPageIndices, 3.2);
 
       for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
         const targetPageIndex = pageMap.get(pageIndex);
@@ -1059,6 +1062,8 @@ export function PdfEditorApp() {
       for (const overlay of overlays) {
         const targetPageIndex = pageMap.get(overlay.pageIndex);
         if (targetPageIndex === undefined) continue;
+
+        // Skip text replacements — they were handled by canvas compositing above
         if (
           overlay.kind === "text" &&
           overlay.sourceTextId &&
@@ -1108,6 +1113,7 @@ export function PdfEditorApp() {
               : 0;
           const textY = pdfY + pdfHeight - paddingTop - fontSize;
 
+          // Draw mask rectangle to cover original text
           if (overlay.kind === "text" && overlay.backgroundColor) {
             const maskWidth = (overlay.maskWidth ?? overlay.width) * scaleX;
             const maskHeight = (overlay.maskHeight ?? overlay.height) * scaleY;

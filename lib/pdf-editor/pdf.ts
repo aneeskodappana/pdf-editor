@@ -1,4 +1,14 @@
-import { StandardFonts, type PDFPage } from "pdf-lib";
+import {
+  PDFArray,
+  PDFDict,
+  PDFName,
+  PDFNumber,
+  PDFRawStream,
+  PDFRef,
+  StandardFonts,
+  type PDFDocument,
+  type PDFPage,
+} from "pdf-lib";
 
 import {
   buildCssFontStack,
@@ -40,7 +50,7 @@ export function sampleMaskColor(
   width: number,
   height: number,
 ) {
-  const margin = 2;
+  const margin = 6;
   const samplePoints = [
     [x - margin, y + height / 2],
     [x + width + margin, y + height / 2],
@@ -51,27 +61,35 @@ export function sampleMaskColor(
     [x - margin, y + height + margin],
     [x + width + margin, y + height + margin],
   ];
-  let red = 0;
-  let green = 0;
-  let blue = 0;
-  let alpha = 0;
-  let count = 0;
+
+  // Collect all valid sampled pixel colors
+  const samples: [number, number, number][] = [];
 
   for (const [sampleX, sampleY] of samplePoints) {
     const px = Math.round(clamp(sampleX, 0, context.canvas.width - 1));
     const py = Math.round(clamp(sampleY, 0, context.canvas.height - 1));
     const data = context.getImageData(px, py, 1, 1).data;
     if (data[3] === 0) continue;
-    red += data[0];
-    green += data[1];
-    blue += data[2];
-    alpha += data[3];
-    count += 1;
+    samples.push([data[0], data[1], data[2]]);
   }
 
-  if (count === 0) return "#ffffff";
+  if (samples.length === 0) return "#ffffff";
 
-  return `rgba(${Math.round(red / count)}, ${Math.round(green / count)}, ${Math.round(blue / count)}, ${Math.max(alpha / count / 255, 0.96).toFixed(3)})`;
+  // Pick the LIGHTEST sample — most likely to be actual background
+  // rather than text or other content near the edges
+  let best = samples[0];
+  let bestLuma = best[0] * 0.299 + best[1] * 0.587 + best[2] * 0.114;
+
+  for (let i = 1; i < samples.length; i++) {
+    const luma =
+      samples[i][0] * 0.299 + samples[i][1] * 0.587 + samples[i][2] * 0.114;
+    if (luma > bestLuma) {
+      best = samples[i];
+      bestLuma = luma;
+    }
+  }
+
+  return rgbToHex(best[0], best[1], best[2]);
 }
 
 function sampleTextColor(
@@ -92,15 +110,13 @@ function sampleTextColor(
     Math.round(clamp(height, 1, Math.max(context.canvas.height - safeY, 1))),
   );
   const imageData = context.getImageData(safeX, safeY, safeWidth, safeHeight).data;
-  const backgroundCss = sampleMaskColor(context, safeX, safeY, safeWidth, safeHeight);
-  const backgroundMatch = backgroundCss.match(
-    /rgba?\((\d+),\s*(\d+),\s*(\d+)/i,
-  );
-  const background: [number, number, number] = backgroundMatch
+  const backgroundHex = sampleMaskColor(context, safeX, safeY, safeWidth, safeHeight);
+  const hexMatch = backgroundHex.match(/^#([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i);
+  const background: [number, number, number] = hexMatch
     ? [
-        Number(backgroundMatch[1]),
-        Number(backgroundMatch[2]),
-        Number(backgroundMatch[3]),
+        parseInt(hexMatch[1], 16),
+        parseInt(hexMatch[2], 16),
+        parseInt(hexMatch[3], 16),
       ]
     : [255, 255, 255];
   let red = 0;
@@ -141,6 +157,267 @@ function sampleTextColor(
   }
 
   return rgbToHex(darkest[0], darkest[1], darkest[2]);
+}
+
+// ---------------------------------------------------------------------------
+// Direct PDF text replacement via content stream manipulation
+// ---------------------------------------------------------------------------
+
+async function inflateBytes(data: Uint8Array): Promise<Uint8Array> {
+  const ds = new DecompressionStream("deflate");
+  const blob = new Blob([data.slice().buffer]);
+  const stream = blob.stream().pipeThrough(ds);
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  const total = chunks.reduce((sum, c) => sum + c.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.length;
+  }
+  return out;
+}
+
+async function deflateBytes(data: Uint8Array): Promise<Uint8Array> {
+  const cs = new CompressionStream("deflate");
+  const blob = new Blob([data.slice().buffer]);
+  const stream = blob.stream().pipeThrough(cs);
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  const total = chunks.reduce((sum, c) => sum + c.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.length;
+  }
+  return out;
+}
+
+/** Encode a JS string to bytes suitable for a PDF literal string body. */
+function toPdfStringBytes(text: string): Uint8Array {
+  const parts: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i);
+    if (ch === 0x28 /* ( */) {
+      parts.push(0x5c, 0x28);
+    } else if (ch === 0x29 /* ) */) {
+      parts.push(0x5c, 0x29);
+    } else if (ch === 0x5c /* \ */) {
+      parts.push(0x5c, 0x5c);
+    } else {
+      parts.push(ch & 0xff);
+    }
+  }
+  return new Uint8Array(parts);
+}
+
+/**
+ * Search for a PDF literal string `(text)` inside raw content-stream bytes,
+ * handling escape sequences. Returns the start index & length of the full
+ * `(…)` token (including parens) or null.
+ */
+function findPdfLiteralString(
+  haystack: Uint8Array,
+  needle: Uint8Array,
+  startFrom = 0,
+): { start: number; length: number } | null {
+  for (let i = startFrom; i < haystack.length; i++) {
+    if (haystack[i] !== 0x28 /* ( */) continue;
+
+    // Walk the literal-string body respecting escapes & nested parens
+    let depth = 1;
+    let j = i + 1;
+    let matched = true;
+    let needleIdx = 0;
+
+    while (j < haystack.length && depth > 0) {
+      const b = haystack[j];
+      if (b === 0x5c /* \ */) {
+        // Escaped pair — compare the escaped char
+        j++;
+        if (j >= haystack.length) break;
+        const escaped = haystack[j];
+        // Map escape to actual byte for comparison
+        let actual: number;
+        if (escaped === 0x6e) actual = 0x0a; // \n
+        else if (escaped === 0x72) actual = 0x0d; // \r
+        else if (escaped === 0x74) actual = 0x09; // \t
+        else actual = escaped; // \(  \)  \\  and others
+
+        if (matched && needleIdx < needle.length) {
+          if (needle[needleIdx] === 0x5c && needleIdx + 1 < needle.length) {
+            // needle also has an escape
+            matched = needle[needleIdx + 1] === escaped;
+            needleIdx += 2;
+          } else {
+            matched = needle[needleIdx] === actual;
+            needleIdx += 1;
+          }
+        } else if (needleIdx >= needle.length) {
+          matched = false;
+        }
+        j++;
+        continue;
+      }
+      if (b === 0x28) {
+        depth++;
+      } else if (b === 0x29) {
+        depth--;
+        if (depth === 0) break;
+      }
+      if (depth > 0) {
+        if (matched && needleIdx < needle.length) {
+          matched = needle[needleIdx] === b;
+          needleIdx++;
+        } else if (needleIdx >= needle.length) {
+          matched = false;
+        }
+      }
+      j++;
+    }
+
+    if (depth === 0 && matched && needleIdx === needle.length) {
+      return { start: i, length: j - i + 1 }; // +1 for closing ')'
+    }
+  }
+  return null;
+}
+
+/**
+ * Replace text directly in a PDF's content streams.
+ * Returns the set of replacement keys (overlay IDs) that were handled.
+ */
+export async function replaceTextInPdf(
+  pdfDoc: PDFDocument,
+  targetPageIndex: number,
+  replacements: { id: string; oldText: string; newText: string }[],
+): Promise<Set<string>> {
+  const handled = new Set<string>();
+  if (replacements.length === 0) return handled;
+
+  const context = pdfDoc.context;
+
+  try {
+    const page = pdfDoc.getPage(targetPageIndex);
+    const contentsEntry = page.node.get(PDFName.of("Contents"));
+    if (!contentsEntry) return handled;
+
+    // Collect stream references
+    const streamRefs: PDFRef[] = [];
+    if (contentsEntry instanceof PDFRef) {
+      streamRefs.push(contentsEntry);
+    } else if (contentsEntry instanceof PDFArray) {
+      for (let i = 0; i < contentsEntry.size(); i++) {
+        const entry = contentsEntry.get(i);
+        if (entry instanceof PDFRef) streamRefs.push(entry);
+      }
+    }
+
+    // Build a work-list of text we still need to replace
+    const pending = replacements.map((r) => ({
+      ...r,
+      needleBytes: toPdfStringBytes(r.oldText),
+      replacementBytes: toPdfStringBytes(r.newText),
+    }));
+
+    for (const ref of streamRefs) {
+      if (pending.every((p) => handled.has(p.id))) break;
+
+      const streamObj = context.lookup(ref);
+      if (
+        !streamObj ||
+        !(streamObj instanceof PDFRawStream || (streamObj as { dict?: unknown }).dict)
+      )
+        continue;
+
+      const rawStream = streamObj as PDFRawStream;
+      const dict = rawStream.dict as PDFDict;
+
+      // Decode the stream content
+      const rawBytes: Uint8Array =
+        typeof rawStream.getContents === "function"
+          ? rawStream.getContents()
+          : (rawStream as unknown as { contents: Uint8Array }).contents;
+
+      const filterValue = dict.get(PDFName.of("Filter"));
+      const isFlate =
+        filterValue !== undefined &&
+        (filterValue.toString().includes("FlateDecode") ||
+          (filterValue instanceof PDFName &&
+            filterValue.decodeText().includes("FlateDecode")));
+
+      let contentBytes: Uint8Array;
+      try {
+        contentBytes = isFlate ? await inflateBytes(rawBytes) : new Uint8Array(rawBytes);
+      } catch {
+        continue;
+      }
+
+      let modified = false;
+
+      for (const rep of pending) {
+        if (handled.has(rep.id)) continue;
+
+        const found = findPdfLiteralString(contentBytes, rep.needleBytes);
+        if (!found) continue;
+
+        // Build replacement: `(replacementText)`
+        const newToken = new Uint8Array(rep.replacementBytes.length + 2);
+        newToken[0] = 0x28; // (
+        newToken.set(rep.replacementBytes, 1);
+        newToken[newToken.length - 1] = 0x29; // )
+
+        // Splice the bytes
+        const before = contentBytes.slice(0, found.start);
+        const after = contentBytes.slice(found.start + found.length);
+        const result = new Uint8Array(before.length + newToken.length + after.length);
+        result.set(before, 0);
+        result.set(newToken, before.length);
+        result.set(after, before.length + newToken.length);
+        contentBytes = result;
+
+        handled.add(rep.id);
+        modified = true;
+      }
+
+      if (!modified) continue;
+
+      // Re-encode and replace the stream object
+      const finalBytes = isFlate ? await deflateBytes(contentBytes) : contentBytes;
+
+      const newDict = PDFDict.withContext(context);
+      // Copy existing dictionary entries, updating Length
+      for (const [key, val] of dict.entries()) {
+        if (key === PDFName.of("Length")) {
+          newDict.set(key, PDFNumber.of(finalBytes.length));
+        } else {
+          newDict.set(key, val);
+        }
+      }
+      if (!newDict.has(PDFName.of("Length"))) {
+        newDict.set(PDFName.of("Length"), PDFNumber.of(finalBytes.length));
+      }
+
+      const newStream = PDFRawStream.of(newDict, finalBytes);
+      context.assign(ref, newStream);
+    }
+  } catch (error) {
+    console.warn("Direct text replacement failed:", error);
+  }
+
+  return handled;
 }
 
 export async function loadPdfJs() {
@@ -366,6 +643,7 @@ export async function renderPdfPages(pdfBytes: Uint8Array) {
           cssFontWeight: resolveEffectiveFontWeight(resolvedFont?.cssFontWeight, bold),
           cssFontStyle: resolveEffectiveFontStyle(resolvedFont?.cssFontStyle, italic),
           color: sampleTextColor(context, x, y, width, fontHeight),
+          sampledBgColor: sampleMaskColor(context, x, y, width, fontHeight),
           lineHeight,
           textOffsetY,
           bold,
@@ -479,8 +757,8 @@ export async function buildPagePreview(
 
   for (const replacement of replacements) {
     const fontSize = replacement.fontSize * coordinateScale;
-    const bleedX = Math.max(3 * coordinateScale, Math.min(fontSize * 0.2, 8 * coordinateScale));
-    const bleedY = Math.max(4 * coordinateScale, Math.min(fontSize * 0.28, 10 * coordinateScale));
+    const bleedX = Math.max(1 * coordinateScale, Math.min(fontSize * 0.08, 4 * coordinateScale));
+    const bleedY = Math.max(2 * coordinateScale, Math.min(fontSize * 0.12, 5 * coordinateScale));
     const scaledX = replacement.x * coordinateScale;
     const scaledY = replacement.y * coordinateScale;
     const scaledWidth = replacement.width * coordinateScale;
@@ -500,8 +778,7 @@ export async function buildPagePreview(
 
     if (width <= 0 || height <= 0) continue;
 
-    context.fillStyle =
-      replacement.backgroundColor || sampleMaskColor(sourceContext, x, y, width, height);
+    context.fillStyle = sampleMaskColor(sourceContext, x, y, width, height);
     context.fillRect(x, y, width, height);
 
     if (!replacement.renderText) continue;
@@ -595,6 +872,7 @@ export function buildOcrTextBlocks(
           cssFontWeight: 400,
           cssFontStyle: "normal",
           color: "#111827",
+          sampledBgColor: "#ffffff",
           lineHeight: 1.12,
           textOffsetY: 0,
           bold: false,
