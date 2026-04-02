@@ -5,6 +5,16 @@ export type RenderedPage = {
   height: number;
   previewUrl: string;
   textBlocks: SourceTextBlock[];
+  sourceImages: SourceImage[];
+};
+
+export type SourceImage = {
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  dataUrl: string;
 };
 
 export type SourceTextBlock = {

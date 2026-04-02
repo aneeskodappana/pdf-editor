@@ -1,22 +1,107 @@
 "use client";
 
 import { resolveEffectiveFontStyle, resolveEffectiveFontWeight } from "../../lib/pdf-editor/fonts";
-import type { Overlay, TextVariant } from "../../lib/pdf-editor/types";
+import type { Overlay, SourceImage, TextVariant } from "../../lib/pdf-editor/types";
 import { getTextVariantMetrics, overlayLabel } from "../../lib/pdf-editor/utils";
 
 export function SelectionInspector({
   selectedOverlay,
+  selectedSourceImage,
   onUpdateOverlay,
   onRemoveOverlay,
   onEditTextOverlay,
   onClearSelection,
+  onRemoveSourceImage,
+  onResizeSourceImage,
+  onReplaceSourceImage,
 }: {
   selectedOverlay: Overlay | null;
+  selectedSourceImage: { pageIndex: number; image: SourceImage } | null;
   onUpdateOverlay: (id: string, patch: Partial<Overlay>) => void;
   onRemoveOverlay: (id: string) => void;
   onEditTextOverlay: (id: string) => void;
   onClearSelection: () => void;
+  onRemoveSourceImage: (pageIndex: number, image: SourceImage) => void;
+  onResizeSourceImage: (pageIndex: number, image: SourceImage) => void;
+  onReplaceSourceImage: (pageIndex: number, image: SourceImage, file: File) => void;
 }) {
+  if (!selectedOverlay && !selectedSourceImage) return null;
+
+  // Source image inspector (when a PDF-embedded image is selected)
+  if (selectedSourceImage && !selectedOverlay) {
+    const { pageIndex, image } = selectedSourceImage;
+    return (
+      <div className="floating-widget floating-inspector">
+        <div className="widget-head">
+          <strong>PDF Image</strong>
+          <button type="button" className="ghost-button widget-close" onClick={onClearSelection}>
+            Close
+          </button>
+        </div>
+
+        <div className="source-image-preview">
+          <img
+            src={image.dataUrl}
+            alt="Selected PDF image"
+            style={{ maxWidth: "100%", maxHeight: 160, borderRadius: 8, border: "1px solid var(--line)" }}
+          />
+        </div>
+
+        <div className="field-stack compact" style={{ marginTop: 12 }}>
+          <div className="grid-two">
+            <label>
+              <span>X</span>
+              <input type="number" value={Math.round(image.x)} readOnly />
+            </label>
+            <label>
+              <span>Y</span>
+              <input type="number" value={Math.round(image.y)} readOnly />
+            </label>
+            <label>
+              <span>W</span>
+              <input type="number" value={Math.round(image.width)} readOnly />
+            </label>
+            <label>
+              <span>H</span>
+              <input type="number" value={Math.round(image.height)} readOnly />
+            </label>
+          </div>
+
+          <div className="source-image-actions">
+            <button
+              type="button"
+              className="ghost-button"
+              onClick={() => onResizeSourceImage(pageIndex, image)}
+            >
+              Resize
+            </button>
+            <label className="ghost-button replace-image-button">
+              Replace
+              <input
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) {
+                    onReplaceSourceImage(pageIndex, image, file);
+                  }
+                  event.target.value = "";
+                }}
+              />
+            </label>
+          </div>
+          <button
+            type="button"
+            className="danger-button"
+            onClick={() => onRemoveSourceImage(pageIndex, image)}
+          >
+            Remove
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (!selectedOverlay) return null;
   const selectedTextIsBold =
     selectedOverlay.kind === "text"

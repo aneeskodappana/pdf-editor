@@ -14,6 +14,7 @@ import type {
   OcrBlock,
   PreviewReplacement,
   RenderedPage,
+  SourceImage,
   TextOverlay,
   WatermarkOverlay,
 } from "./types";
@@ -152,6 +153,141 @@ export async function loadPdfJs() {
   return pdfjsLib;
 }
 
+async function extractPageImages(
+  page: { getOperatorList: () => Promise<{ fnArray: number[]; argsArray: unknown[][] }>; objs: { get: (name: string) => unknown }; commonObjs: { get: (name: string) => unknown } },
+  viewport: { transform: number[]; width: number; height: number },
+  pdfjsLib: { OPS: Record<string, number>; Util: { transform: (a: number[], b: number[]) => number[] } },
+  pageIndex: number,
+): Promise<SourceImage[]> {
+  const images: SourceImage[] = [];
+
+  try {
+    const ops = await page.getOperatorList();
+    const OPS = pdfjsLib.OPS;
+
+    // Walk through operations looking for transforms followed by image paints
+    let currentTransform = viewport.transform;
+    const transformStack: number[][] = [currentTransform];
+
+    for (let i = 0; i < ops.fnArray.length; i++) {
+      const fn = ops.fnArray[i];
+      const args = ops.argsArray[i];
+
+      if (fn === OPS.save) {
+        transformStack.push(currentTransform);
+        continue;
+      }
+
+      if (fn === OPS.restore) {
+        currentTransform = transformStack.pop() ?? viewport.transform;
+        continue;
+      }
+
+      if (fn === OPS.transform) {
+        const m = args as unknown as number[];
+        currentTransform = pdfjsLib.Util.transform(currentTransform, m);
+        continue;
+      }
+
+      if (fn === OPS.paintImageXObject || fn === OPS.paintImageXObjectRepeat) {
+        const imageName = args[0] as string;
+        if (!imageName) continue;
+
+        // Image objects are stored in page.objs or page.commonObjs
+        type PdfImageData = { width: number; height: number; data: Uint8ClampedArray; bitmap?: undefined } | { width: number; height: number; bitmap: ImageBitmap; data?: undefined };
+        let imageData: PdfImageData | null = null;
+        try {
+          const raw = page.objs.get(imageName);
+          if (raw && typeof raw === "object" && ("data" in raw || "bitmap" in raw)) {
+            imageData = raw as PdfImageData;
+          }
+        } catch {
+          try {
+            const raw = page.commonObjs.get(imageName);
+            if (raw && typeof raw === "object" && ("data" in raw || "bitmap" in raw)) {
+              imageData = raw as PdfImageData;
+            }
+          } catch {
+            continue;
+          }
+        }
+
+        if (!imageData) continue;
+
+        // The transform maps a unit square [0,0]-[1,1] to the image position
+        // currentTransform = [a, b, c, d, e, f] where:
+        //   a = scaleX, d = scaleY (can be negative), e = translateX, f = translateY
+        const t = currentTransform;
+        const imgWidth = Math.abs(t[0]) || Math.abs(t[1]);
+        const imgHeight = Math.abs(t[3]) || Math.abs(t[2]);
+
+        // Skip tiny images (likely artifacts, icons, or borders)
+        if (imgWidth < 20 || imgHeight < 20) continue;
+
+        // Compute top-left corner
+        const x = t[4];
+        // PDF.js may set negative scaleY, adjusting y accordingly
+        const y = t[3] < 0 ? t[5] - imgHeight : t[5];
+
+        // Extract image pixels to a data URL
+        let dataUrl = "";
+        try {
+          const canvas = document.createElement("canvas");
+          const sourceWidth = imageData.bitmap?.width ?? imageData.width ?? 1;
+          const sourceHeight = imageData.bitmap?.height ?? imageData.height ?? 1;
+          canvas.width = sourceWidth;
+          canvas.height = sourceHeight;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) continue;
+
+          if (imageData.bitmap) {
+            ctx.drawImage(imageData.bitmap, 0, 0);
+          } else if (imageData.data && imageData.width && imageData.height) {
+            const imgData = ctx.createImageData(imageData.width, imageData.height);
+            // PDF.js image data may be RGB (3 channels) or RGBA (4 channels)
+            const srcData = imageData.data;
+            const dstData = imgData.data;
+            if (srcData.length === imageData.width * imageData.height * 4) {
+              dstData.set(srcData);
+            } else if (srcData.length === imageData.width * imageData.height * 3) {
+              for (let p = 0, d = 0; p < srcData.length; p += 3, d += 4) {
+                dstData[d] = srcData[p];
+                dstData[d + 1] = srcData[p + 1];
+                dstData[d + 2] = srcData[p + 2];
+                dstData[d + 3] = 255;
+              }
+            } else {
+              continue;
+            }
+            ctx.putImageData(imgData, 0, 0);
+          } else {
+            continue;
+          }
+
+          dataUrl = canvas.toDataURL("image/png");
+        } catch {
+          continue;
+        }
+
+        if (!dataUrl) continue;
+
+        images.push({
+          id: `img-${pageIndex}-${images.length}`,
+          x: clamp(x, 0, viewport.width),
+          y: clamp(y, 0, viewport.height),
+          width: clamp(imgWidth, 1, viewport.width),
+          height: clamp(imgHeight, 1, viewport.height),
+          dataUrl,
+        });
+      }
+    }
+  } catch (error) {
+    console.warn("Image extraction failed for page", pageIndex, error);
+  }
+
+  return images;
+}
+
 export async function renderPdfPages(pdfBytes: Uint8Array) {
   const pdfjsLib = await loadPdfJs();
   const previewScale = 1.4;
@@ -237,6 +373,13 @@ export async function renderPdfPages(pdfBytes: Uint8Array) {
         };
       });
 
+    const sourceImages = await extractPageImages(
+      page as unknown as Parameters<typeof extractPageImages>[0],
+      viewport,
+      pdfjsLib as unknown as Parameters<typeof extractPageImages>[2],
+      index - 1,
+    );
+
     pages.push({
       pdfWidth: baseViewport.width,
       pdfHeight: baseViewport.height,
@@ -244,6 +387,7 @@ export async function renderPdfPages(pdfBytes: Uint8Array) {
       height: viewport.height,
       previewUrl: canvas.toDataURL("image/png"),
       textBlocks,
+      sourceImages,
     });
   }
 

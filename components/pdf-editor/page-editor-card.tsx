@@ -12,6 +12,7 @@ import type {
   ImageOverlay,
   Overlay,
   RenderedPage,
+  SourceImage,
   SourceTextBlock,
   TextOverlay,
   TextVariant,
@@ -58,6 +59,8 @@ export function PageEditorCard({
   onStopTextEditing,
   onOverlayPointerDown,
   onImageResizePointerDown,
+  onSelectSourceImage,
+  selectedSourceImageId,
 }: {
   page: RenderedPage;
   pageIndex: number;
@@ -93,6 +96,8 @@ export function PageEditorCard({
     event: ReactPointerEvent<HTMLElement>,
     overlay: ImageOverlay,
   ) => void;
+  onSelectSourceImage: (image: SourceImage) => void;
+  selectedSourceImageId: string | null;
 }) {
   const replacementPreviewReady = pagePreviewUrl !== page.previewUrl;
   const activeTextOverlay = overlays.find(
@@ -302,6 +307,26 @@ export function PageEditorCard({
               title={`Replace "${textBlock.text}"`}
               aria-label={`Replace ${textBlock.text}`}
               onDoubleClick={() => onCreateTextReplacement(textBlock)}
+            />
+          ))}
+
+          {page.sourceImages.map((sourceImage) => (
+            <button
+              type="button"
+              key={sourceImage.id}
+              className={`source-image-target ${showTextTargets ? "guides-visible" : ""} ${selectedSourceImageId === sourceImage.id ? "active" : ""}`}
+              style={{
+                left: sourceImage.x,
+                top: sourceImage.y,
+                width: sourceImage.width,
+                height: sourceImage.height,
+              }}
+              title="Select image"
+              aria-label="Select embedded image"
+              onClick={(event) => {
+                event.stopPropagation();
+                onSelectSourceImage(sourceImage);
+              }}
             />
           ))}
 

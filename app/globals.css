@@ -496,6 +496,62 @@ img {
   pointer-events: none;
 }
 
+.source-image-target {
+  position: absolute;
+  z-index: 1;
+  display: block;
+  border: 2px dashed transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: transparent;
+  overflow: hidden;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.source-image-target.guides-visible,
+.source-image-target:hover,
+.source-image-target:focus-visible {
+  background: rgba(154, 79, 25, 0.08);
+  border-color: rgba(154, 79, 25, 0.52);
+}
+
+.source-image-target.active {
+  background: rgba(154, 79, 25, 0.12);
+  border-color: rgba(154, 79, 25, 0.7);
+  box-shadow: 0 0 0 3px rgba(154, 79, 25, 0.14);
+}
+
+.source-image-preview {
+  display: flex;
+  justify-content: center;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.03);
+}
+
+.source-image-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.source-image-actions .ghost-button {
+  flex: 1;
+  min-height: 38px;
+  justify-content: center;
+}
+
+.replace-image-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.replace-image-button input {
+  display: none;
+}
+
 .overlay-item {
   position: absolute;
   z-index: 3;

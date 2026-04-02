@@ -35,6 +35,7 @@ import type {
   Overlay,
   PreviewReplacement,
   RenderedPage,
+  SourceImage,
   SourceTextBlock,
   TextOverlay,
 } from "../lib/pdf-editor/types";
@@ -107,6 +108,7 @@ function clonePages(pages: RenderedPage[]) {
   return pages.map((page) => ({
     ...page,
     textBlocks: page.textBlocks.map((textBlock) => ({ ...textBlock })),
+    sourceImages: page.sourceImages.map((img) => ({ ...img })),
   }));
 }
 
@@ -143,6 +145,7 @@ export function PdfEditorApp() {
   const [canRedo, setCanRedo] = useState(false);
   const [draggingOverlayId, setDraggingOverlayId] = useState<string | null>(null);
   const [, setStatusMessage] = useState("Ready");
+  const [selectedSourceImage, setSelectedSourceImage] = useState<{ pageIndex: number; image: SourceImage } | null>(null);
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const dragDepthRef = useRef(0);
   const pagesRef = useRef<RenderedPage[]>([]);
@@ -326,6 +329,7 @@ export function PdfEditorApp() {
     setSelectedOverlayId(null);
     setEditingTextOverlayId(null);
     setDraggingOverlayId(null);
+    setSelectedSourceImage(null);
   }
 
   async function loadPdfFile(file: File) {
@@ -626,6 +630,115 @@ export function PdfEditorApp() {
       maxWidth: 220,
       maxHeight: 100,
     });
+  }
+
+  function selectSourceImage(pageIndex: number, image: SourceImage) {
+    setSelectedOverlayId(null);
+    setEditingTextOverlayId(null);
+    setDraggingOverlayId(null);
+    setSelectedSourceImage({ pageIndex, image });
+    setStatusMessage("Image selected");
+  }
+
+  function removeSourceImage(pageIndex: number, image: SourceImage) {
+    const overlay: Overlay = {
+      id: makeId(),
+      kind: "mask",
+      pageIndex,
+      x: image.x,
+      y: image.y,
+      width: image.width,
+      height: image.height,
+      color: "#ffffff",
+    };
+    applyOverlayChange((current) => [...current, overlay]);
+    setSelectedSourceImage(null);
+    setSelectedOverlayId(overlay.id);
+    setStatusMessage("Image removed");
+  }
+
+  async function resizeSourceImage(pageIndex: number, image: SourceImage) {
+    // Create a mask over the original image location
+    const maskOverlay: Overlay = {
+      id: makeId(),
+      kind: "mask",
+      pageIndex,
+      x: image.x,
+      y: image.y,
+      width: image.width,
+      height: image.height,
+      color: "#ffffff",
+    };
+
+    // Create a resizable image overlay with the extracted image data
+    const aspectRatio = Math.max(image.width / Math.max(image.height, 1), 0.1);
+    const imgOverlay: ImageOverlay = {
+      id: makeId(),
+      kind: "image",
+      pageIndex,
+      x: image.x,
+      y: image.y,
+      width: image.width,
+      height: image.height,
+      aspectRatio,
+      dataUrl: image.dataUrl,
+      label: "Resized image",
+      opacity: 1,
+    };
+
+    applyOverlayChange((current) => [...current, maskOverlay, imgOverlay]);
+    setSelectedSourceImage(null);
+    setSelectedOverlayId(imgOverlay.id);
+    setStatusMessage("Resize image");
+  }
+
+  async function replaceSourceImage(pageIndex: number, image: SourceImage, file: File) {
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      const dims = await getImageDimensions(dataUrl);
+      const frame = fitImageSize(
+        dims.width,
+        dims.height,
+        image.width,
+        image.height,
+      );
+
+      // Mask the original
+      const maskOverlay: Overlay = {
+        id: makeId(),
+        kind: "mask",
+        pageIndex,
+        x: image.x,
+        y: image.y,
+        width: image.width,
+        height: image.height,
+        color: "#ffffff",
+      };
+
+      // Place replacement overlay centered on the original location
+      const aspectRatio = Math.max(dims.width / Math.max(dims.height, 1), 0.1);
+      const imgOverlay: ImageOverlay = {
+        id: makeId(),
+        kind: "image",
+        pageIndex,
+        x: image.x + (image.width - frame.width) / 2,
+        y: image.y + (image.height - frame.height) / 2,
+        width: frame.width,
+        height: frame.height,
+        aspectRatio,
+        dataUrl,
+        label: "Replaced image",
+        opacity: 1,
+      };
+
+      applyOverlayChange((current) => [...current, maskOverlay, imgOverlay]);
+      setSelectedSourceImage(null);
+      setSelectedOverlayId(imgOverlay.id);
+      setStatusMessage("Image replaced");
+    } catch (error) {
+      console.error(error);
+      setStatusMessage("Replace failed");
+    }
   }
 
   function createTextReplacement(pageIndex: number, textBlock: SourceTextBlock) {
@@ -1225,6 +1338,8 @@ export function PdfEditorApp() {
             onStopTextEditing={() => setEditingTextOverlayId(null)}
             onOverlayPointerDown={handleOverlayPointerDown}
             onImageResizePointerDown={handleImageResizePointerDown}
+            onSelectSourceImage={(image) => selectSourceImage(pageIndex, image)}
+            selectedSourceImageId={selectedSourceImage?.pageIndex === pageIndex ? selectedSourceImage.image.id : null}
           />
         ))}
 
@@ -1247,6 +1362,7 @@ export function PdfEditorApp() {
 
       <SelectionInspector
         selectedOverlay={selectedOverlay}
+        selectedSourceImage={selectedSourceImage}
         onUpdateOverlay={updateOverlay}
         onRemoveOverlay={removeOverlay}
         onEditTextOverlay={(overlayId) => {
@@ -1254,6 +1370,9 @@ export function PdfEditorApp() {
           setEditingTextOverlayId(overlayId);
         }}
         onClearSelection={clearActiveSelection}
+        onRemoveSourceImage={(pageIndex, image) => removeSourceImage(pageIndex, image)}
+        onResizeSourceImage={(pageIndex, image) => void resizeSourceImage(pageIndex, image)}
+        onReplaceSourceImage={(pageIndex, image, file) => void replaceSourceImage(pageIndex, image, file)}
       />
     </main>
   );
